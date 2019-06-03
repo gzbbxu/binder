@@ -164,7 +164,7 @@ int binder_call(struct binder_state *bs,
 
 
 
-例子：怎么构造binder_io
+例子：怎么构造binder_io，binder_io 会指向一个缓冲区。这个缓冲区是iodata ,实际上binder_io 是对这个缓冲区的管理。首先初始化，然后就可以对缓冲区里面放数据了。
 
 ![](binderio.jpg)
 
@@ -178,7 +178,7 @@ binder_io 用来描述iodata 的buf .
 
 数据发送给驱动程序，数据中除了binder_io 之外，还有target,code ,msg. **他们一起构造binder_write_read** 
 
-![](C:\Users\yuanshuai\Desktop\binder\binder\bwr_write.jpg)
+![](bwr_write.jpg)
 
 writeBuf 定义：
 
@@ -188,6 +188,33 @@ writeBuf 定义：
 
 
 
+**binder_call内部实现**
+
+![](writebuf.jpg)
+
+**Client:** 
+
+a,  binder_open。
+
+b, 获得服务：服务进程的handle。
+
+c, 构造参数：binder_io 
+
+d，调用binder_call (handle,code,binder_io,)
+
+e，binder_call 返回binder_io ，分析，取出返回值 （放在一个buf 中）
+
+**server:**
+
+a,binder_open
+
+b,注册服务
+
+c,ioctl (读) ，读到的数据是client发送的。，读取到handle,code ,参数
+
+d,解析数据。得到binder_write_read ，readbuf -> 指向binder_transation_data 。 转换binder_io 
+
+e,根据code ,来决定调用什么函数了。从binder_io 取出参数。传给要调用的函数，处理完之后，把返回值再次转换为binder_io 发给client 。
 
 
 
@@ -195,14 +222,41 @@ writeBuf 定义：
 
 
 
+### 数据传输过程（进程切换）
+
+① client 构造数据 ，调用ioctl 发送数据
+
+② 驱动里根据handler 找到server 进程。
+
+③ 把数据放入进程的某个binder_proc  -> todo 链表中,，进入休眠。
+
+​		对应的server 程序，在它的循环体里面，肯定是先读，后写。根据数据的指示 ，来进行操作。把结果写回client 程序。先读后写①： 发起读操作，没有数据的时候休眠，②，当把数据放入todo 链表中，被唤醒。③：从todo 链表中把数据取出数据，返回用户控件。④： 处理 ⑤：把结构写给client .也是放入client 的binder_proc.todo 链表找那个。唤醒client .
+
+④：被唤醒，从todo 链表中取出数据，返回用户空间。
 
 
 
+### 数据如何复制
 
+**一般方法** 
 
+①client 构造好数据   。需要两次复制，效率比较低
 
+② 驱动 copy_from_user    **server**: 1,驱动 copy_to_user 2， 用户态处理。
 
+**binder 方法**
 
+① server mmap 用户态可以直接防访问 驱动中某块内存。
+
+② client 构造数 驱动程序：copy_from_user  把用户态复制到内核的这块内存中。
+
+③ server 程序客户以在用户态，直接使用数据。所以只需要一次拷贝。 
+
+④ 涉及结构体binder_buffer  。 数据只需要复制一次，数据头还是需要复制两次的。
+
+​    io_ctrl 需要binder_write_read 这个结构体需要复制两次。这个结构体有某个指针指向发送的数据。
+
+​    copy_from_user 到内存局部变量，然后copy_to_user 到service.
 
 
 
