@@ -399,11 +399,985 @@ binder_proc 中有 **rb_root  threads** ;是一个红黑树，这个树里面挂
 
 ​    io_ctrl 需要binder_write_read 这个结构体需要复制两次。这个结构体有某个指针指向发送的数据。
 
-​    copy_from_user 到内存局部变量，然后copy_to_user 到service.
+​    copy_from_user 到内存局部变量，然后copy_to_user 到service。而数据本身只需要一次复制。
 
 
 
 gi clone https://github.com/weidongshan/APP_0003_Binder_C_App.git
+
+
+
+
+
+
+
+
+
+#### 情景分析
+
+应用程序调用ioctl 来和驱动程序进行交互，会传入结构体，binder_write_read 结构体。
+
+```
+res= ioctl(bs->fd,BINDER_WRITE_READ,&bwr);
+```
+
+写数据的时候，binder_write_read 的 write_buffer 会指向数据本身，
+
+write_buffer，read_buffer 
+
+```
+struct {
+	uint32_t cmd;
+	struct binder_transaction_data txn;
+}__attribute__((packed))writebuf;
+```
+
+write_buffer数据是怎么组织的呢？前面4个字节来表示数据类型。后面紧跟着要发送的数据。
+
+当读数据的时候，读取的是binder_write_read 结构体。读取的read_buffer 和 write_buffer 的数据结构体类似。前面四个字节来表示读取的数据类型，后面紧跟着数据本身。
+
+应用程序调用ioctl,传入BINDER_WRITE_READ宏，对应驱动程序的binder_ioctl (Binder.c)，
+
+cmd 变量就会接收到BINDER_WRITE_READ，（参考binder_ioctl_write_read 函数）会从用户空间得到binder_write_read 结构体，分辨read_size,write_size .分别调用binder_thread_read，binder_thread_write函数。在这两个函数里可以添加打印所有的消息类型。
+
+/*print infor: proc'name ,proc id ,thread id ,cmd'name*/
+
+如何打印数据？
+
+binder_thread_read ，binder_thread_write 写读数据分别关心，BR_TRANSACTION,BC_TRANSACTION
+
+
+
+写数据的时候，最终会调用
+
+```java
+binder_transaction(proc, thread, &tr.transaction_data,
+					   cmd == BC_REPLY_SG, tr.buffers_size);
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+```java
+static long binder_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
+{
+	int ret;
+	struct binder_proc *proc = filp->private_data;
+	struct binder_thread *thread;
+	unsigned int size = _IOC_SIZE(cmd);
+	void __user *ubuf = (void __user *)arg;
+
+	/*pr_info("binder_ioctl: %d:%d %x %lx\n",
+			proc->pid, current->pid, cmd, arg);*/
+
+	binder_selftest_alloc(&proc->alloc);
+
+	trace_binder_ioctl(cmd, arg);
+
+	ret = wait_event_interruptible(binder_user_error_wait, binder_stop_on_user_error < 2);
+	if (ret)
+		goto err_unlocked;
+
+	thread = binder_get_thread(proc);
+	if (thread == NULL) {
+		ret = -ENOMEM;
+		goto err;
+	}
+
+	switch (cmd) {
+	case BINDER_WRITE_READ:
+		ret = binder_ioctl_write_read(filp, cmd, arg, thread);
+		if (ret)
+			goto err;
+		break;
+	case BINDER_SET_MAX_THREADS: {
+		int max_threads;
+
+		if (copy_from_user(&max_threads, ubuf,
+				   sizeof(max_threads))) {
+			ret = -EINVAL;
+			goto err;
+		}
+		binder_inner_proc_lock(proc);
+		proc->max_threads = max_threads;
+		binder_inner_proc_unlock(proc);
+		break;
+	}
+	case BINDER_SET_CONTEXT_MGR:
+		ret = binder_ioctl_set_ctx_mgr(filp);
+		if (ret)
+			goto err;
+		break;
+	case BINDER_THREAD_EXIT:
+		binder_debug(BINDER_DEBUG_THREADS, "%d:%d exit\n",
+			     proc->pid, thread->pid);
+		binder_thread_release(proc, thread);
+		thread = NULL;
+		break;
+	case BINDER_VERSION: {
+		struct binder_version __user *ver = ubuf;
+
+		if (size != sizeof(struct binder_version)) {
+			ret = -EINVAL;
+			goto err;
+		}
+		if (put_user(BINDER_CURRENT_PROTOCOL_VERSION,
+			     &ver->protocol_version)) {
+			ret = -EINVAL;
+			goto err;
+		}
+		break;
+	}
+	case BINDER_GET_NODE_DEBUG_INFO: {
+		struct binder_node_debug_info info;
+
+		if (copy_from_user(&info, ubuf, sizeof(info))) {
+			ret = -EFAULT;
+			goto err;
+		}
+
+		ret = binder_ioctl_get_node_debug_info(proc, &info);
+		if (ret < 0)
+			goto err;
+
+		if (copy_to_user(ubuf, &info, sizeof(info))) {
+			ret = -EFAULT;
+			goto err;
+		}
+		break;
+	}
+	default:
+		ret = -EINVAL;
+		goto err;
+	}
+	ret = 0;
+err:
+	if (thread)
+		thread->looper_need_return = false;
+	wait_event_interruptible(binder_user_error_wait, binder_stop_on_user_error < 2);
+	if (ret && ret != -ERESTARTSYS)
+		pr_info("%d:%d ioctl %x %lx returned %d\n", proc->pid, current->pid, cmd, arg, ret);
+err_unlocked:
+	trace_binder_ioctl_done(ret);
+	return ret;
+}
+
+
+
+static int binder_ioctl_write_read(struct file *filp,
+				unsigned int cmd, unsigned long arg,
+				struct binder_thread *thread)
+{
+	int ret = 0;
+	struct binder_proc *proc = filp->private_data;
+	unsigned int size = _IOC_SIZE(cmd);
+	void __user *ubuf = (void __user *)arg;
+	struct binder_write_read bwr;
+
+	if (size != sizeof(struct binder_write_read)) {
+		ret = -EINVAL;
+		goto out;
+	}
+	if (copy_from_user(&bwr, ubuf, sizeof(bwr))) {
+		ret = -EFAULT;
+		goto out;
+	}
+	binder_debug(BINDER_DEBUG_READ_WRITE,
+		     "%d:%d write %lld at %016llx, read %lld at %016llx\n",
+		     proc->pid, thread->pid,
+		     (u64)bwr.write_size, (u64)bwr.write_buffer,
+		     (u64)bwr.read_size, (u64)bwr.read_buffer);
+
+	if (bwr.write_size > 0) {
+		ret = binder_thread_write(proc, thread,
+					  bwr.write_buffer,
+					  bwr.write_size,
+					  &bwr.write_consumed);
+		trace_binder_write_done(ret);
+		if (ret < 0) {
+			bwr.read_consumed = 0;
+			if (copy_to_user(ubuf, &bwr, sizeof(bwr)))
+				ret = -EFAULT;
+			goto out;
+		}
+	}
+	if (bwr.read_size > 0) {
+		ret = binder_thread_read(proc, thread, bwr.read_buffer,
+					 bwr.read_size,
+					 &bwr.read_consumed,
+					 filp->f_flags & O_NONBLOCK);
+		trace_binder_read_done(ret);
+		binder_inner_proc_lock(proc);
+		if (!binder_worklist_empty_ilocked(&proc->todo))
+			binder_wakeup_proc_ilocked(proc);
+		binder_inner_proc_unlock(proc);
+		if (ret < 0) {
+			if (copy_to_user(ubuf, &bwr, sizeof(bwr)))
+				ret = -EFAULT;
+			goto out;
+		}
+	}
+	binder_debug(BINDER_DEBUG_READ_WRITE,
+		     "%d:%d wrote %lld of %lld, read return %lld of %lld\n",
+		     proc->pid, thread->pid,
+		     (u64)bwr.write_consumed, (u64)bwr.write_size,
+		     (u64)bwr.read_consumed, (u64)bwr.read_size);
+	if (copy_to_user(ubuf, &bwr, sizeof(bwr))) {
+		ret = -EFAULT;
+		goto out;
+	}
+out:
+	return ret;
+}
+```
+
+
+
+**binder 调用分析**
+
+命令的详细介绍
+
+http://blog.csdn.net/universus/article/details/6211589
+
+binder 的通信会涉及到两个进程
+
+![](06.png)
+
+只有BC_TRANSACTION,BR_TRANSACTION,BC_REPLY,BR_REPLY  涉及两进程，其他所有的cmd, BCXXX,BRXX,只是app和驱动的交互过程,用户改变或者报告状态。
+
+
+
+#### **服务的注册过程**
+
+应用程序怎么访问驱动程序？
+
+app:open,read,write,ioctl访问驱动
+
+驱动:drv_open,drv_read,drv_write ... 
+
+怎么写驱动?
+
+​	1,构造file_operator 结构体。
+
+   .open=drv_open
+
+   .read=drv_read
+
+​	2,告诉内核 ： 注册驱动
+
+​	register_chrdev();
+
+​	3, 驱动程序的入口函数 调用register_chrdev。
+
+
+
+分析：
+
+1，首先service_manager 执行binder_thread_write:,传入BC_ENTER_OOPER
+
+2,   接着发起binder_thread_read ，传入BR_NOOP，往后就休眠了，等待其他程序给他发送注册服务的消息。
+
+​	  binder_open,打开驱动程序，获取版本信息，mmap 。 并没有引起binder_thread_read 操作。
+
+​      接着调用binder_become_context_manager，ioctl(bs->fd, BINDER_SET_CONTEXT_MGR, 0); 告诉内核，这里就是Service_manager 。当其他的服务程序或者客户端程序，向handle 为0的节点发送数据的时候，驱动程序就可以找到Service_manager 进程。这里也不会引起binder_thread_write操作。
+
+3，binder_loop 中，调用binder_write 发起一个写操作。操作的类型就是BC_ENTER_LOOPER，
+
+```c
+int main()
+{
+    struct binder_state *bs;
+
+    bs = binder_open(128*1024);
+    if (!bs) {
+        ALOGE("failed to open binder driver\n");
+        return -1;
+    }
+
+    if (binder_become_context_manager(bs)) {
+        ALOGE("cannot become context manager (%s)\n", strerror(errno));
+        return -1;
+    }
+
+    selinux_enabled = is_selinux_enabled();
+    sehandle = selinux_android_service_context_handle();
+    selinux_status_open(true);
+
+    if (selinux_enabled > 0) {
+        if (sehandle == NULL) {
+            ALOGE("SELinux: Failed to acquire sehandle. Aborting.\n");
+            abort();
+        }
+
+        if (getcon(&service_manager_context) != 0) {
+            ALOGE("SELinux: Failed to acquire service_manager context. Aborting.\n");
+            abort();
+        }
+    }
+
+    union selinux_callback cb;
+    cb.func_audit = audit_callback;
+    selinux_set_callback(SELINUX_CB_AUDIT, cb);
+    cb.func_log = selinux_log_callback;
+    selinux_set_callback(SELINUX_CB_LOG, cb);
+
+    binder_loop(bs, svcmgr_handler);
+
+    return 0;
+}
+static int binder_open(struct inode *nodp, struct file *filp)
+{
+	struct binder_proc *proc;
+	struct binder_device *binder_dev;
+
+	binder_debug(BINDER_DEBUG_OPEN_CLOSE, "binder_open: %d:%d\n",
+		     current->group_leader->pid, current->pid);
+
+	proc = kzalloc(sizeof(*proc), GFP_KERNEL);
+	if (proc == NULL)
+		return -ENOMEM;
+	spin_lock_init(&proc->inner_lock);
+	spin_lock_init(&proc->outer_lock);
+	get_task_struct(current->group_leader);
+	proc->tsk = current->group_leader;
+	INIT_LIST_HEAD(&proc->todo);
+	if (binder_supported_policy(current->policy)) {
+		proc->default_priority.sched_policy = current->policy;
+		proc->default_priority.prio = current->normal_prio;
+	} else {
+		proc->default_priority.sched_policy = SCHED_NORMAL;
+		proc->default_priority.prio = NICE_TO_PRIO(0);
+	}
+
+	binder_dev = container_of(filp->private_data, struct binder_device,
+				  miscdev);
+	proc->context = &binder_dev->context;
+	binder_alloc_init(&proc->alloc);
+
+	binder_stats_created(BINDER_STAT_PROC);
+	proc->pid = current->group_leader->pid;
+	INIT_LIST_HEAD(&proc->delivered_death);
+	INIT_LIST_HEAD(&proc->waiting_threads);
+	filp->private_data = proc;
+
+	mutex_lock(&binder_procs_lock);
+	hlist_add_head(&proc->proc_node, &binder_procs);
+	mutex_unlock(&binder_procs_lock);
+
+	if (binder_debugfs_dir_entry_proc) {
+		char strbuf[11];
+
+		snprintf(strbuf, sizeof(strbuf), "%u", proc->pid);
+		/*
+		 * proc debug entries are shared between contexts, so
+		 * this will fail if the process tries to open the driver
+		 * again with a different context. The priting code will
+		 * anyway print all contexts that a given PID has, so this
+		 * is not a problem.
+		 */
+		proc->debugfs_entry = debugfs_create_file(strbuf, S_IRUGO,
+			binder_debugfs_dir_entry_proc,
+			(void *)(unsigned long)proc->pid,
+			&binder_proc_fops);
+	}
+
+	return 0;
+}
+
+int binder_become_context_manager(struct binder_state *bs)
+{
+    return ioctl(bs->fd, BINDER_SET_CONTEXT_MGR, 0);
+}
+
+
+void binder_loop(struct binder_state *bs, binder_handler func)
+{
+    int res;
+    struct binder_write_read bwr;
+    uint32_t readbuf[32];
+
+    bwr.write_size = 0;
+    bwr.write_consumed = 0;
+    bwr.write_buffer = 0;
+
+    readbuf[0] = BC_ENTER_LOOPER;
+    binder_write(bs, readbuf, sizeof(uint32_t));
+
+    for (;;) {
+        bwr.read_size = sizeof(readbuf);
+        bwr.read_consumed = 0;
+        bwr.read_buffer = (uintptr_t) readbuf;
+
+        res = ioctl(bs->fd, BINDER_WRITE_READ, &bwr);
+
+        if (res < 0) {
+            ALOGE("binder_loop: ioctl failed (%s)\n", strerror(errno));
+            break;
+        }
+
+        res = binder_parse(bs, 0, (uintptr_t) readbuf, bwr.read_consumed, func);
+        if (res == 0) {
+            ALOGE("binder_loop: unexpected reply?!\n");
+            break;
+        }
+        if (res < 0) {
+            ALOGE("binder_loop: io error %d %s\n", res, strerror(errno));
+            break;
+        }
+    }
+}
+
+
+```
+
+
+
+**调用过程分析**：
+
+1,service_manager 调用ioctl, BC_ENTER_LOOPER,对应调用binder驱动的 binder_ioctl 函数。
+
+binder_get_thread 获取结构体。
+
+```c
+void binder_loop(struct binder_state *bs, binder_handler func)
+{
+    int res;
+    struct binder_write_read bwr;
+    uint32_t readbuf[32];
+
+    bwr.write_size = 0;
+    bwr.write_consumed = 0;
+    bwr.write_buffer = 0;
+
+    readbuf[0] = BC_ENTER_LOOPER;
+    binder_write(bs, readbuf, sizeof(uint32_t));
+
+    for (;;) {
+        bwr.read_size = sizeof(readbuf);
+        bwr.read_consumed = 0;
+        bwr.read_buffer = (uintptr_t) readbuf;
+
+        res = ioctl(bs->fd, BINDER_WRITE_READ, &bwr);
+
+        if (res < 0) {
+            ALOGE("binder_loop: ioctl failed (%s)\n", strerror(errno));
+            break;
+        }
+
+        res = binder_parse(bs, 0, (uintptr_t) readbuf, bwr.read_consumed, func);
+        if (res == 0) {
+            ALOGE("binder_loop: unexpected reply?!\n");
+            break;
+        }
+        if (res < 0) {
+            ALOGE("binder_loop: io error %d %s\n", res, strerror(errno));
+            break;
+        }
+    }
+}
+```
+
+```c
+static long binder_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
+{
+	int ret;
+	struct binder_proc *proc = filp->private_data;
+	struct binder_thread *thread;
+	unsigned int size = _IOC_SIZE(cmd);
+	void __user *ubuf = (void __user *)arg;
+
+	/*pr_info("binder_ioctl: %d:%d %x %lx\n",
+			proc->pid, current->pid, cmd, arg);*/
+
+	binder_selftest_alloc(&proc->alloc);
+
+	trace_binder_ioctl(cmd, arg);
+
+	ret = wait_event_interruptible(binder_user_error_wait, binder_stop_on_user_error < 2);
+	if (ret)
+		goto err_unlocked;
+
+	thread = binder_get_thread(proc);
+	if (thread == NULL) {
+		ret = -ENOMEM;
+		goto err;
+	}
+
+	switch (cmd) {
+	case BINDER_WRITE_READ:
+		ret = binder_ioctl_write_read(filp, cmd, arg, thread);
+		if (ret)
+			goto err;
+		break;
+	case BINDER_SET_MAX_THREADS: {
+		int max_threads;
+
+		if (copy_from_user(&max_threads, ubuf,
+				   sizeof(max_threads))) {
+			ret = -EINVAL;
+			goto err;
+		}
+		binder_inner_proc_lock(proc);
+		proc->max_threads = max_threads;
+		binder_inner_proc_unlock(proc);
+		break;
+	}
+	case BINDER_SET_CONTEXT_MGR:
+		ret = binder_ioctl_set_ctx_mgr(filp);
+		if (ret)
+			goto err;
+		break;
+	case BINDER_THREAD_EXIT:
+		binder_debug(BINDER_DEBUG_THREADS, "%d:%d exit\n",
+			     proc->pid, thread->pid);
+		binder_thread_release(proc, thread);
+		thread = NULL;
+		break;
+	case BINDER_VERSION: {
+		struct binder_version __user *ver = ubuf;
+
+		if (size != sizeof(struct binder_version)) {
+			ret = -EINVAL;
+			goto err;
+		}
+		if (put_user(BINDER_CURRENT_PROTOCOL_VERSION,
+			     &ver->protocol_version)) {
+			ret = -EINVAL;
+			goto err;
+		}
+		break;
+	}
+	case BINDER_GET_NODE_DEBUG_INFO: {
+		struct binder_node_debug_info info;
+
+		if (copy_from_user(&info, ubuf, sizeof(info))) {
+			ret = -EFAULT;
+			goto err;
+		}
+
+		ret = binder_ioctl_get_node_debug_info(proc, &info);
+		if (ret < 0)
+			goto err;
+
+		if (copy_to_user(ubuf, &info, sizeof(info))) {
+			ret = -EFAULT;
+			goto err;
+		}
+		break;
+	}
+	default:
+		ret = -EINVAL;
+		goto err;
+	}
+	ret = 0;
+err:
+	if (thread)
+		thread->looper_need_return = false;
+	wait_event_interruptible(binder_user_error_wait, binder_stop_on_user_error < 2);
+	if (ret && ret != -ERESTARTSYS)
+		pr_info("%d:%d ioctl %x %lx returned %d\n", proc->pid, current->pid, cmd, arg, ret);
+err_unlocked:
+	trace_binder_ioctl_done(ret);
+	return ret;
+}
+```
+
+
+
+```c
+static struct binder_thread *binder_get_thread(struct binder_proc *proc)
+{
+	struct binder_thread *thread;
+	struct binder_thread *new_thread;
+
+	binder_inner_proc_lock(proc);
+	thread = binder_get_thread_ilocked(proc, NULL);
+	binder_inner_proc_unlock(proc);
+	if (!thread) {
+		new_thread = kzalloc(sizeof(*thread), GFP_KERNEL);
+		if (new_thread == NULL)
+			return NULL;
+		binder_inner_proc_lock(proc);
+		thread = binder_get_thread_ilocked(proc, new_thread);
+		binder_inner_proc_unlock(proc);
+		if (thread != new_thread)
+			kfree(new_thread);
+	}
+	return thread;
+}
+```
+
+读数据是怎么排列的？
+
+binder_write_buf -> readbuf 
+
+![](07.png)
+
+
+
+**binder_io 怎么构造数据？**
+
+```c
+ bio_init(&msg, iodata, sizeof(iodata), 4);
+    bio_put_uint32(&msg, 0);  // strict mode header
+    bio_put_string16_x(&msg, SVC_MGR_NAME);
+    bio_put_string16_x(&msg, name);
+    bio_put_obj(&msg, ptr);
+```
+
+
+
+**bio_put_obj**
+
+
+
+server 传入一个flat_binder_object 给驱动，在内核里面就会去创建binder_node. 根据这个结构体，去创建binder_node 。
+
+```c
+void bio_put_obj(struct binder_io *bio, void *ptr)
+{
+    struct flat_binder_object *obj;
+
+    obj = bio_alloc_obj(bio);
+    if (!obj)
+        return;
+
+    obj->flags = 0x7f | FLAT_BINDER_FLAG_ACCEPTS_FDS;
+    obj->type = BINDER_TYPE_BINDER;
+    obj->binder = (uintptr_t)ptr;
+    obj->cookie = 0;
+}
+```
+
+内核驱动程序，怎么知道在这么一堆数据中，会有flat_binder_object?
+
+bio_alloc_obj 函数中，offs 指向这个结构体。
+
+```c
+static struct flat_binder_object *bio_alloc_obj(struct binder_io *bio)
+{
+    struct flat_binder_object *obj;
+
+    obj = bio_alloc(bio, sizeof(*obj));
+
+    if (obj && bio->offs_avail) {
+        bio->offs_avail--;
+        *bio->offs++ = ((char*) obj) - ((char*) bio->data0);
+        return obj;
+    }
+
+    bio->flags |= BIO_F_OVERFLOW;
+    return NULL;
+}
+```
+
+
+
+string16 表示两个字节存一个字符。
+
+bio_init 会把前面16个字节空出来。
+
+![](08.png)
+
+
+
+binder_call 会根据构造好的binder_io 构造binder_write_read 结构体，会传给驱动程序。
+
+```c
+int binder_call(struct binder_state *bs,
+                struct binder_io *msg, struct binder_io *reply,
+                uint32_t target, uint32_t code)
+{
+    int res;
+    struct binder_write_read bwr;
+    struct {
+        uint32_t cmd;
+        struct binder_transaction_data txn;
+    } __attribute__((packed)) writebuf;
+    unsigned readbuf[32];
+
+    if (msg->flags & BIO_F_OVERFLOW) {
+        fprintf(stderr,"binder: txn buffer overflow\n");
+        goto fail;
+    }
+
+    writebuf.cmd = BC_TRANSACTION;
+    writebuf.txn.target.handle = target;
+    writebuf.txn.code = code;
+    writebuf.txn.flags = 0;
+    writebuf.txn.data_size = msg->data - msg->data0;
+    writebuf.txn.offsets_size = ((char*) msg->offs) - ((char*) msg->offs0);
+    writebuf.txn.data.ptr.buffer = (uintptr_t)msg->data0;
+    writebuf.txn.data.ptr.offsets = (uintptr_t)msg->offs0;
+
+    bwr.write_size = sizeof(writebuf);
+    bwr.write_consumed = 0;
+    bwr.write_buffer = (uintptr_t) &writebuf;
+
+    hexdump(msg->data0, msg->data - msg->data0);
+    for (;;) {
+        bwr.read_size = sizeof(readbuf);
+        bwr.read_consumed = 0;
+        bwr.read_buffer = (uintptr_t) readbuf;
+
+        res = ioctl(bs->fd, BINDER_WRITE_READ, &bwr);
+
+        if (res < 0) {
+            fprintf(stderr,"binder: ioctl failed (%s)\n", strerror(errno));
+            goto fail;
+        }
+
+        res = binder_parse(bs, reply, (uintptr_t) readbuf, bwr.read_consumed, 0);
+        if (res == 0) return 0;
+        if (res < 0) goto fail;
+    }
+
+fail:
+    memset(reply, 0, sizeof(*reply));
+    reply->flags |= BIO_F_IOERROR;
+    return -1;
+}
+```
+
+
+
+##### 以上总结
+
+- 构造数据
+  - 构造bnder_io
+  - 转换为binder_transaction_data.
+  - 放入binder_write_read .
+  
+- 发送数据 ，ioctl，应用程序调用ioctl,会导致binder_ioctl 会被调用。
+
+- 进入驱动程序 binder_ioctl .用一句话来描述作用就是（把数据放入service_manager 进程的todo 链表，并唤醒它。）
+  - 根据handle 找到目的进程，service_manager.
+  
+  - 把数据copy_from_user 放到mmap 的空间（原来数据是用户空间的，要复制到service_manager的内核空间）
+  
+    binder_call 调用ioctl, 传入cmd为 BINDER_WRITE_READ，构造的binder_write_read结构体cmd 为BC_TRANSACTION，BINDER_WRITE_READ为参考binder_call函数.
+  
+    关键代码如下：
+  
+    ```c
+    case BC_TRANSACTION:
+    		case BC_REPLY: {
+    			struct binder_transaction_data tr;
+    
+    			if (copy_from_user(&tr, ptr, sizeof(tr)))
+    				return -EFAULT;
+    			ptr += sizeof(tr);
+    			binder_transaction(proc, thread, &tr,
+    					   cmd == BC_REPLY, 0);
+    			break;
+    		}
+    ```
+  
+    他们会调用binder_transaction 做进一步处理，关键代码如下:
+  
+    如果传入的目的进程handle 不是0 的话，就会根据handle 找到binder_ref 结构体。binder_ref 结构体，是对binder_node 的引用，
+  
+    ```c
+    if (tr->target.handle) {
+    			struct binder_ref *ref;
+    
+    			/*
+    			 * There must already be a strong ref
+    			 * on this node. If so, do a strong
+    			 * increment on the node to ensure it
+    			 * stays alive until the transaction is
+    			 * done.
+    			 */
+    			binder_proc_lock(proc);
+    			ref = binder_get_ref_olocked(proc, tr->target.handle,
+    						     true);
+    			if (ref) {
+    				target_node = binder_get_node_refs_for_txn(
+    						ref->node, &target_proc,
+    						&return_error);
+    			} else {
+    				binder_user_error("%d:%d got transaction to invalid handle\n",
+    						  proc->pid, thread->pid);
+    				return_error = BR_FAILED_REPLY;
+    			}
+    			binder_proc_unlock(proc);
+    		} else {
+        		//如果是0 的情况下，特殊的节点，service manager 打开驱动后，
+                // 会调用ioctl 告诉
+    			mutex_lock(&context->context_mgr_node_lock);
+    			target_node = context->binder_context_mgr_node;
+    			if (target_node)
+    				target_node = binder_get_node_refs_for_txn(
+    						target_node, &target_proc,
+    						&return_error);
+    			else
+    				return_error = BR_DEAD_REPLY;
+    			mutex_unlock(&context->context_mgr_node_lock);
+    		}
+    		if (!target_node) {
+    			/*
+    			 * return_error is set above
+    			 */
+    			return_error_param = -EINVAL;
+    			return_error_line = __LINE__;
+    			goto err_dead_binder;
+    		}
+    		e->to_node = target_node->debug_id;
+    		if (security_binder_transaction(proc->tsk,
+    						target_proc->tsk) < 0) {
+    			return_error = BR_FAILED_REPLY;
+    			return_error_param = -EPERM;
+    			return_error_line = __LINE__;
+    			goto err_invalid_target_handle;
+    		}
+    		binder_inner_proc_lock(proc);
+    		if (!(tr->flags & TF_ONE_WAY) && thread->transaction_stack) {
+    			struct binder_transaction *tmp;
+    
+    			tmp = thread->transaction_stack;
+    			if (tmp->to_thread != thread) {
+    				spin_lock(&tmp->lock);
+    				binder_user_error("%d:%d got new transaction with bad transaction stack, transaction %d has target %d:%d\n",
+    					proc->pid, thread->pid, tmp->debug_id,
+    					tmp->to_proc ? tmp->to_proc->pid : 0,
+    					tmp->to_thread ?
+    					tmp->to_thread->pid : 0);
+    				spin_unlock(&tmp->lock);
+    				binder_inner_proc_unlock(proc);
+    				return_error = BR_FAILED_REPLY;
+    				return_error_param = -EPROTO;
+    				return_error_line = __LINE__;
+    				goto err_bad_call_stack;
+    			}
+    			while (tmp) {
+    				struct binder_thread *from;
+    
+    				spin_lock(&tmp->lock);
+    				from = tmp->from;
+    				if (from && from->proc == target_proc) {
+    					atomic_inc(&from->tmp_ref);
+    					target_thread = from;
+    					spin_unlock(&tmp->lock);
+    					break;
+    				}
+    				spin_unlock(&tmp->lock);
+    				tmp = tmp->from_parent;
+    			}
+    		}
+    		binder_inner_proc_unlock(proc);
+    	}
+    ```
+  
+    如果是0的话，成为service_manager 
+    
+    ```c
+    case BINDER_SET_CONTEXT_MGR:
+    		ret = binder_ioctl_set_ctx_mgr(filp);
+    		if (ret)
+    			goto err;
+    		break;
+    ```
+    
+    
+  
+  
+  
+  
+  
+  - 处理offset 数据，flat_binder_object 
+    - 内核态构造binder_node 
+    - 构造binder_ref 给service_manager 
+    - 增加引用
+    
+     server传入一个flat_binder_object 给驱动，驱动程序会为每个服务创建binder_node 节点。
+  - 唤醒目的进程。
+
+
+
+
+
+
+
+flat_binder_object 
+
+type: 实体/引用 只有service 只能传实体。
+
+falgs
+
+binder/handle  type 为实体的时候，为binder ,引用的时候为handle
+
+
+
+
+
+
+
+
+
+
+
+
+
+#### 服务的获取过程
+
+
+
+
+
+### java 程序
+
+
+
+
+
+hello.java - > Hello.class ->dex 格式。  编译成class ,转换为dex .
+
+怎么转换？dx 命令
+
+方法1，
+
+dex --dex --output=Hello.jar Helo.class
+
+
+
+alvikvm -cp  /mnt/Helo.jar Hello
+
+
+
+
+
+方法2: app_process 启动应用程序。
+
+CLASSPATH = /mnt/Hello.jar app_process ./ Hello
+
+
+
+方法3：把代码放到android 源码中编译
+
+添加Android.mk 内容类似  //frameworks/base/cmds/am/Android.mk
+
+
+
+
+
+**bouml 时序图**
+
+
+
+![](09.png)
+
+
+
+
 
 
 
